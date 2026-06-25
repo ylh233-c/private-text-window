@@ -146,6 +146,7 @@ class PrivateTextWindow:
         self._rendering = False
         self._save_after_id: str | None = None
         self._settings_save_after_id: str | None = None
+        self._status_after_id: str | None = None
         self._drag_start: tuple[int, int, int, int] | None = None
         self._resize_start: tuple[int, int, int, int] | None = None
         self._restore_borderless_after_minimize = False
@@ -203,6 +204,17 @@ class PrivateTextWindow:
         self.resize_grip = tk.Frame(self.root, bg="#e9e9e9", cursor="size_nw_se")
         self.resize_grip.bind("<ButtonPress-1>", self.start_resize)
         self.resize_grip.bind("<B1-Motion>", self.resize_window)
+
+        self.status_label = tk.Label(
+            self.root,
+            text="",
+            bg="white",
+            fg="#1f883d",
+            bd=0,
+            padx=4,
+            pady=2,
+            font=("Microsoft YaHei UI", 9),
+        )
 
         self.bind_shortcuts()
         self.apply_chrome()
@@ -615,7 +627,21 @@ class PrivateTextWindow:
         self.root.clipboard_clear()
         self.root.clipboard_append(self.full_text)
         self.root.update()
+        self.show_status("已复制全部内容")
         return "break"
+
+    def show_status(self, message: str, timeout_ms: int = 1500) -> None:
+        if self._status_after_id is not None:
+            self.root.after_cancel(self._status_after_id)
+            self._status_after_id = None
+        self.status_label.configure(text=message)
+        self.status_label.lift()
+        self.status_label.place(relx=0.0, rely=1.0, x=8, y=-8, anchor="sw")
+        self._status_after_id = self.root.after(timeout_ms, self.clear_status)
+
+    def clear_status(self) -> None:
+        self._status_after_id = None
+        self.status_label.place_forget()
 
     def clear_all(self, _event: tk.Event | None = None) -> str:
         if not messagebox.askyesno("确认清空", "确定要清空全部已输入内容吗？此操作不可撤销。"):
@@ -784,6 +810,9 @@ class PrivateTextWindow:
         if self._settings_save_after_id is not None:
             self.root.after_cancel(self._settings_save_after_id)
             self._settings_save_after_id = None
+        if self._status_after_id is not None:
+            self.root.after_cancel(self._status_after_id)
+            self._status_after_id = None
         self.save_now()
         self.root.destroy()
 

@@ -5,3 +5,4 @@ __pycache__/
 # Local runtime data. Do not publish personal history/settings.
 history.txt
 settings.json
+private_text_window.ico
