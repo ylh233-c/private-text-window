@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+*.tmp
+
+# Local runtime data. Do not publish personal history/settings.
+history.txt
+settings.json

@@ -1,0 +1,799 @@
+from __future__ import annotations
+
+import ctypes
+import json
+from pathlib import Path
+import struct
+import sys
+import tkinter as tk
+from tkinter import messagebox
+from tkinter import ttk
+
+
+APP_DIR = Path(__file__).resolve().parent
+HISTORY_PATH = APP_DIR / "history.txt"
+SETTINGS_PATH = APP_DIR / "settings.json"
+ICON_PATH = APP_DIR / "private_text_window.ico"
+IS_WINDOWS = sys.platform.startswith("win")
+
+DEFAULT_SETTINGS = {
+    "opacity": 0.92,
+    "font_size": 18,
+    "visible_chars": 20,
+    "borderless": False,
+    "expanded": False,
+    "topmost": True,
+    "geometry": "420x180+120+120",
+    "cursor": 0,
+}
+
+
+def clamp(value: int | float, low: int | float, high: int | float) -> int | float:
+    return max(low, min(high, value))
+
+
+def coerce_float(value: object, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def coerce_int(value: object, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def coerce_bool(value: object, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return default
+
+
+def read_text(path: Path) -> str:
+    if not path.exists():
+        return ""
+    return path.read_text(encoding="utf-8")
+
+
+def write_text_atomic(path: Path, content: str) -> None:
+    tmp_path = path.with_name(path.name + ".tmp")
+    tmp_path.write_text(content, encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def ensure_icon_file() -> None:
+    if ICON_PATH.exists():
+        return
+
+    width = 32
+    height = 32
+    pixels = bytearray()
+    for y in range(height - 1, -1, -1):
+        for x in range(width):
+            r, g, b, a = 0, 0, 0, 0
+            in_page = 5 <= x <= 26 and 4 <= y <= 27
+            if in_page:
+                r, g, b, a = 248, 248, 248, 255
+                if x in (5, 26) or y in (4, 27):
+                    r, g, b = 34, 34, 34
+                if x == 11 and 10 <= y <= 21:
+                    r, g, b = 0, 0, 0
+                if 15 <= x <= 22 and y in (11, 16, 21):
+                    r, g, b = 90, 90, 90
+            pixels.extend((b, g, r, a))
+
+    mask_stride = ((width + 31) // 32) * 4
+    and_mask = bytes(mask_stride * height)
+    dib_header = struct.pack(
+        "<IIIHHIIIIII",
+        40,
+        width,
+        height * 2,
+        1,
+        32,
+        0,
+        len(pixels),
+        0,
+        0,
+        0,
+        0,
+    )
+    image = dib_header + bytes(pixels) + and_mask
+    icon_dir = struct.pack("<HHH", 0, 1, 1)
+    icon_entry = struct.pack("<BBBBHHII", width, height, 0, 0, 1, 32, len(image), 22)
+    ICON_PATH.write_bytes(icon_dir + icon_entry + image)
+
+
+def load_settings() -> dict:
+    settings = DEFAULT_SETTINGS.copy()
+    if SETTINGS_PATH.exists():
+        try:
+            saved = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            saved = {}
+        if isinstance(saved, dict):
+            settings.update(saved)
+    settings["opacity"] = float(clamp(coerce_float(settings.get("opacity"), 0.92), 0.3, 1.0))
+    settings["font_size"] = int(clamp(coerce_int(settings.get("font_size"), 18), 8, 72))
+    settings["visible_chars"] = int(clamp(coerce_int(settings.get("visible_chars"), 20), 1, 5000))
+    settings["cursor"] = int(max(0, coerce_int(settings.get("cursor"), 0)))
+    settings["borderless"] = False
+    settings["expanded"] = coerce_bool(settings.get("expanded"), False)
+    settings["topmost"] = coerce_bool(settings.get("topmost"), True)
+    if not isinstance(settings.get("geometry"), str):
+        settings["geometry"] = DEFAULT_SETTINGS["geometry"]
+    return settings
+
+
+class PrivateTextWindow:
+    def __init__(self) -> None:
+        self.settings = load_settings()
+        self.full_text = read_text(HISTORY_PATH)
+        self.cursor = int(clamp(self.settings["cursor"], 0, len(self.full_text)))
+        self.expanded = bool(self.settings["expanded"])
+        self.display_start = 0
+        self._rendering = False
+        self._save_after_id: str | None = None
+        self._settings_save_after_id: str | None = None
+        self._drag_start: tuple[int, int, int, int] | None = None
+        self._resize_start: tuple[int, int, int, int] | None = None
+        self._restore_borderless_after_minimize = False
+        self._refreshing_taskbar_icon = False
+
+        self.root = tk.Tk()
+        self.root.title("Private Text")
+        self.set_window_icon()
+        try:
+            self.root.geometry(str(self.settings["geometry"]))
+        except tk.TclError:
+            self.settings["geometry"] = DEFAULT_SETTINGS["geometry"]
+            self.root.geometry(DEFAULT_SETTINGS["geometry"])
+        self.root.minsize(180, 80)
+        self.root.configure(bg="white")
+        self.root.attributes("-alpha", self.settings["opacity"])
+        self.root.attributes("-topmost", self.settings["topmost"])
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
+
+        self.font = ("Microsoft YaHei UI", self.settings["font_size"])
+
+        self.drag_strip = tk.Frame(self.root, height=8, bg="white", cursor="fleur")
+        self.drag_strip.bind("<ButtonPress-1>", self.start_drag)
+        self.drag_strip.bind("<B1-Motion>", self.drag_window)
+
+        self.toolbar = tk.Frame(self.root, bg="#f7f7f7", padx=8, pady=6)
+        self._build_toolbar()
+
+        self.text = tk.Text(
+            self.root,
+            bg="white",
+            fg="black",
+            insertbackground="black",
+            selectbackground="#d8e8ff",
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+            wrap="char",
+            undo=True,
+            padx=8,
+            pady=8,
+            font=self.font,
+        )
+        self.text.pack(fill="both", expand=True)
+        self.text.bind("<KeyPress>", self.on_key_press)
+        self.text.bind("<ButtonPress-1>", self.on_text_click)
+        self.text.bind("<ButtonRelease-1>", self.sync_from_expanded_event)
+        self.text.bind("<KeyRelease>", self.sync_from_expanded_event)
+        self.text.bind("<<Modified>>", self.on_text_modified)
+        self.text.bind("<Enter>", self.focus_editor)
+        self.root.bind("<Enter>", self.focus_editor)
+        self.root.bind("<Configure>", self.on_configure)
+        self.root.bind("<Map>", self.on_map)
+
+        self.resize_grip = tk.Frame(self.root, bg="#e9e9e9", cursor="size_nw_se")
+        self.resize_grip.bind("<ButtonPress-1>", self.start_resize)
+        self.resize_grip.bind("<B1-Motion>", self.resize_window)
+
+        self.bind_shortcuts()
+        self.apply_chrome()
+        self.render()
+        self.root.after(50, self.focus_editor)
+        self.root.after(120, lambda: self.force_taskbar_icon(refresh=True))
+
+    def set_window_icon(self) -> None:
+        try:
+            ensure_icon_file()
+            self.root.iconbitmap(str(ICON_PATH))
+        except (OSError, tk.TclError):
+            pass
+
+    def _build_toolbar(self) -> None:
+        self.borderless_var = tk.BooleanVar(value=self.settings["borderless"])
+        self.topmost_var = tk.BooleanVar(value=self.settings["topmost"])
+        self.opacity_var = tk.IntVar(value=round(self.settings["opacity"] * 100))
+        self.font_size_var = tk.IntVar(value=self.settings["font_size"])
+        self.visible_chars_var = tk.IntVar(value=self.settings["visible_chars"])
+
+        ttk.Checkbutton(
+            self.toolbar,
+            text="无边框",
+            variable=self.borderless_var,
+            command=self.set_borderless_from_toolbar,
+        ).grid(row=0, column=0, padx=(0, 10), sticky="w")
+        ttk.Checkbutton(
+            self.toolbar,
+            text="置顶",
+            variable=self.topmost_var,
+            command=self.set_topmost_from_toolbar,
+        ).grid(row=0, column=1, padx=(0, 12), sticky="w")
+
+        ttk.Label(self.toolbar, text="透明度").grid(row=0, column=2, padx=(0, 4), sticky="e")
+        ttk.Scale(
+            self.toolbar,
+            from_=30,
+            to=100,
+            orient="horizontal",
+            variable=self.opacity_var,
+            command=self.set_opacity_from_toolbar,
+            length=110,
+        ).grid(row=0, column=3, padx=(0, 12), sticky="ew")
+
+        ttk.Label(self.toolbar, text="字号").grid(row=0, column=4, padx=(0, 4), sticky="e")
+        font_spin = ttk.Spinbox(
+            self.toolbar,
+            from_=8,
+            to=72,
+            textvariable=self.font_size_var,
+            width=4,
+            command=self.set_font_size_from_toolbar,
+        )
+        font_spin.grid(row=0, column=5, padx=(0, 12), sticky="w")
+        font_spin.bind("<Return>", lambda _event: self.set_font_size_from_toolbar())
+        font_spin.bind("<FocusOut>", lambda _event: self.set_font_size_from_toolbar())
+
+        ttk.Label(self.toolbar, text="显示字数").grid(row=0, column=6, padx=(0, 4), sticky="e")
+        visible_spin = ttk.Spinbox(
+            self.toolbar,
+            from_=1,
+            to=5000,
+            textvariable=self.visible_chars_var,
+            width=6,
+            command=self.set_visible_chars_from_toolbar,
+        )
+        visible_spin.grid(row=0, column=7, padx=(0, 12), sticky="w")
+        visible_spin.bind("<Return>", lambda _event: self.set_visible_chars_from_toolbar())
+        visible_spin.bind("<FocusOut>", lambda _event: self.set_visible_chars_from_toolbar())
+
+        ttk.Button(self.toolbar, text="展开全部", command=self.toggle_expanded).grid(
+            row=0, column=8, padx=(0, 6), sticky="w"
+        )
+        ttk.Button(self.toolbar, text="复制全部", command=self.copy_all).grid(
+            row=0, column=9, padx=(0, 6), sticky="w"
+        )
+        ttk.Button(self.toolbar, text="最小化", command=self.minimize_to_taskbar).grid(
+            row=0, column=10, padx=(0, 6), sticky="w"
+        )
+        ttk.Button(self.toolbar, text="清空", command=self.clear_all).grid(row=0, column=11, sticky="w")
+        self.toolbar.grid_columnconfigure(3, weight=1)
+
+    def bind_shortcuts(self) -> None:
+        for sequence in ("<Control-b>", "<Control-B>"):
+            self.root.bind_all(sequence, self.toggle_borderless)
+        for sequence in ("<Control-e>", "<Control-E>"):
+            self.root.bind_all(sequence, self.toggle_expanded)
+        for sequence in ("<Control-Shift-c>", "<Control-Shift-C>"):
+            self.root.bind_all(sequence, self.copy_all)
+        for sequence in ("<Control-t>", "<Control-T>"):
+            self.root.bind_all(sequence, self.toggle_topmost)
+        for sequence in ("<Control-q>", "<Control-Q>"):
+            self.root.bind_all(sequence, self.close_from_shortcut)
+        for sequence in ("<Control-m>", "<Control-M>"):
+            self.root.bind_all(sequence, self.minimize_to_taskbar)
+        self.root.bind_all("<Control-Up>", lambda _event: self.adjust_opacity(0.05))
+        self.root.bind_all("<Control-Down>", lambda _event: self.adjust_opacity(-0.05))
+        self.root.bind_all("<Control-plus>", lambda _event: self.adjust_font_size(1))
+        self.root.bind_all("<Control-equal>", lambda _event: self.adjust_font_size(1))
+        self.root.bind_all("<Control-KP_Add>", lambda _event: self.adjust_font_size(1))
+        self.root.bind_all("<Control-minus>", lambda _event: self.adjust_font_size(-1))
+        self.root.bind_all("<Control-KP_Subtract>", lambda _event: self.adjust_font_size(-1))
+        self.root.bind_all("<Control-Shift-Delete>", self.clear_all)
+
+    def focus_editor(self, _event: tk.Event | None = None) -> None:
+        self.text.focus_set()
+
+    def apply_chrome(self) -> None:
+        borderless = bool(self.settings["borderless"])
+        self.root.overrideredirect(borderless)
+        self.borderless_var.set(borderless)
+
+        self.toolbar.pack_forget()
+        self.drag_strip.pack_forget()
+        self.resize_grip.place_forget()
+
+        if borderless:
+            self.drag_strip.pack(side="top", fill="x", before=self.text)
+            self.resize_grip.place(relx=1.0, rely=1.0, anchor="se", width=16, height=16)
+        else:
+            self.toolbar.pack(side="top", fill="x", before=self.text)
+        self.root.after(20, self.root.update_idletasks)
+        self.root.after(60, lambda: self.force_taskbar_icon(refresh=borderless))
+
+    def force_taskbar_icon(self, refresh: bool = False) -> None:
+        if not IS_WINDOWS:
+            return
+        try:
+            self.root.update_idletasks()
+            user32 = ctypes.windll.user32
+            hwnd = int(self.root.winfo_id())
+            parent_hwnd = int(user32.GetParent(hwnd))
+            target_hwnd = parent_hwnd or hwnd
+
+            gwl_exstyle = -20
+            ws_ex_toolwindow = 0x00000080
+            ws_ex_appwindow = 0x00040000
+            swp_nomove = 0x0002
+            swp_nosize = 0x0001
+            swp_nozorder = 0x0004
+            swp_framechanged = 0x0020
+
+            get_long = getattr(user32, "GetWindowLongPtrW", user32.GetWindowLongW)
+            set_long = getattr(user32, "SetWindowLongPtrW", user32.SetWindowLongW)
+            style = int(get_long(target_hwnd, gwl_exstyle))
+            style = (style | ws_ex_appwindow) & ~ws_ex_toolwindow
+            set_long(target_hwnd, gwl_exstyle, style)
+            user32.SetWindowPos(
+                target_hwnd,
+                0,
+                0,
+                0,
+                0,
+                0,
+                swp_nomove | swp_nosize | swp_nozorder | swp_framechanged,
+            )
+            if refresh and self.root.state() != "iconic":
+                self._refreshing_taskbar_icon = True
+                self.root.withdraw()
+                self.root.after(30, self.restore_after_taskbar_refresh)
+        except (AttributeError, OSError, tk.TclError):
+            self._refreshing_taskbar_icon = False
+            return
+
+    def restore_after_taskbar_refresh(self) -> None:
+        self.root.deiconify()
+        self.root.attributes("-topmost", self.settings["topmost"])
+        self._refreshing_taskbar_icon = False
+        self.focus_editor()
+
+    def apply_visual_settings(self) -> None:
+        self.settings["font_size"] = int(clamp(int(self.settings["font_size"]), 8, 72))
+        self.settings["visible_chars"] = int(clamp(int(self.settings["visible_chars"]), 1, 5000))
+        self.settings["opacity"] = float(clamp(float(self.settings["opacity"]), 0.3, 1.0))
+        self.font = ("Microsoft YaHei UI", self.settings["font_size"])
+        self.text.configure(font=self.font)
+        self.root.attributes("-alpha", self.settings["opacity"])
+        self.root.attributes("-topmost", self.settings["topmost"])
+        self.opacity_var.set(round(self.settings["opacity"] * 100))
+        self.font_size_var.set(self.settings["font_size"])
+        self.visible_chars_var.set(self.settings["visible_chars"])
+        self.topmost_var.set(self.settings["topmost"])
+        self.render()
+        self.schedule_settings_save()
+
+    def render(self) -> None:
+        self._rendering = True
+        self.text.configure(state="normal")
+        self.text.delete("1.0", "end")
+
+        if self.expanded:
+            self.text.insert("1.0", self.full_text)
+            self.text.mark_set("insert", self.index_from_offset(self.cursor))
+            self.text.see("insert")
+        else:
+            visible_count = int(self.settings["visible_chars"])
+            self.display_start = max(0, self.cursor - visible_count)
+            visible_text = self.full_text[self.display_start : self.cursor]
+            self.text.insert("1.0", visible_text)
+            self.text.mark_set("insert", "end-1c")
+            self.text.see("insert")
+        self.text.edit_modified(False)
+        self._rendering = False
+
+    def on_key_press(self, event: tk.Event) -> str | None:
+        shortcut_result = self.handle_shortcut_key(event)
+        if shortcut_result == "break":
+            return "break"
+
+        if self.expanded:
+            return None
+
+        keysym = event.keysym
+        if keysym == "Left":
+            self.move_cursor(-1)
+        elif keysym == "Right":
+            self.move_cursor(1)
+        elif keysym == "Home":
+            self.set_cursor(0)
+        elif keysym == "End":
+            self.set_cursor(len(self.full_text))
+        elif keysym == "BackSpace":
+            self.delete_before_cursor()
+        elif keysym == "Delete":
+            self.delete_after_cursor()
+        else:
+            return None
+        return "break"
+
+    def handle_shortcut_key(self, event: tk.Event) -> str | None:
+        ctrl = self.has_ctrl(event)
+        shift = self.has_shift(event)
+        keysym = event.keysym
+        lower = keysym.lower()
+
+        if ctrl and lower == "v" and not self.expanded:
+            self.paste_at_cursor()
+            return "break"
+        if ctrl and lower == "c" and (shift or not self.expanded):
+            self.copy_all()
+            return "break"
+        if ctrl and lower == "b":
+            self.toggle_borderless()
+            return "break"
+        if ctrl and lower == "e":
+            self.toggle_expanded()
+            return "break"
+        if ctrl and lower == "t":
+            self.toggle_topmost()
+            return "break"
+        if ctrl and lower == "m":
+            self.minimize_to_taskbar()
+            return "break"
+        if ctrl and lower == "q":
+            self.close()
+            return "break"
+        if ctrl and keysym == "Up":
+            self.adjust_opacity(0.05)
+            return "break"
+        if ctrl and keysym == "Down":
+            self.adjust_opacity(-0.05)
+            return "break"
+        if ctrl and keysym in ("plus", "equal", "KP_Add"):
+            self.adjust_font_size(1)
+            return "break"
+        if ctrl and keysym in ("minus", "KP_Subtract"):
+            self.adjust_font_size(-1)
+            return "break"
+        if ctrl and keysym == "Right" and not self.expanded:
+            self.adjust_visible_chars(20 if shift else 5)
+            return "break"
+        if ctrl and keysym == "Left" and not self.expanded:
+            self.adjust_visible_chars(-20 if shift else -5)
+            return "break"
+        if ctrl and shift and keysym == "Delete":
+            self.clear_all()
+            return "break"
+        return None
+
+    def has_ctrl(self, event: tk.Event) -> bool:
+        return bool(int(event.state) & 0x0004)
+
+    def has_shift(self, event: tk.Event) -> bool:
+        return bool(int(event.state) & 0x0001)
+
+    def has_ctrl_or_alt(self, event: tk.Event) -> bool:
+        state = int(event.state)
+        return bool(state & 0x0004) or bool(state & 0x0008)
+
+    def insert_text(self, value: str) -> None:
+        self.full_text = self.full_text[: self.cursor] + value + self.full_text[self.cursor :]
+        self.cursor += len(value)
+        self.persist_cursor()
+        self.render()
+        self.schedule_save()
+
+    def paste_at_cursor(self) -> None:
+        try:
+            value = self.root.clipboard_get()
+        except tk.TclError:
+            return
+        if value:
+            self.insert_text(value)
+
+    def move_cursor(self, delta: int) -> None:
+        self.set_cursor(self.cursor + delta)
+
+    def set_cursor(self, value: int) -> None:
+        self.cursor = int(clamp(value, 0, len(self.full_text)))
+        self.persist_cursor()
+        self.render()
+
+    def delete_before_cursor(self) -> None:
+        if self.cursor <= 0:
+            return
+        self.full_text = self.full_text[: self.cursor - 1] + self.full_text[self.cursor :]
+        self.cursor -= 1
+        self.persist_cursor()
+        self.render()
+        self.schedule_save()
+
+    def delete_after_cursor(self) -> None:
+        if self.cursor >= len(self.full_text):
+            return
+        self.full_text = self.full_text[: self.cursor] + self.full_text[self.cursor + 1 :]
+        self.persist_cursor()
+        self.render()
+        self.schedule_save()
+
+    def on_text_click(self, event: tk.Event) -> str | None:
+        if self.expanded:
+            return None
+        self.text.focus_set()
+        clicked_index = self.text.index(f"@{event.x},{event.y}")
+        offset = self.offset_from_index(clicked_index)
+        self.set_cursor(self.display_start + offset)
+        return "break"
+
+    def on_text_modified(self, _event: tk.Event) -> None:
+        if self._rendering:
+            self.text.edit_modified(False)
+            return
+        if not self.text.edit_modified():
+            return
+        if self.expanded:
+            self.sync_from_expanded()
+        else:
+            self.sync_from_hidden_widget()
+        self.text.edit_modified(False)
+
+    def sync_from_hidden_widget(self) -> None:
+        old_segment = self.full_text[self.display_start : self.cursor]
+        new_segment = self.text.get("1.0", "end-1c")
+        old_insert_offset = self.cursor - self.display_start
+        new_insert_offset = self.offset_from_index("insert")
+        if old_segment == new_segment and old_insert_offset == new_insert_offset:
+            return
+
+        prefix = 0
+        prefix_limit = min(len(old_segment), len(new_segment))
+        while prefix < prefix_limit and old_segment[prefix] == new_segment[prefix]:
+            prefix += 1
+
+        suffix = 0
+        old_remaining = len(old_segment) - prefix
+        new_remaining = len(new_segment) - prefix
+        while (
+            suffix < old_remaining
+            and suffix < new_remaining
+            and old_segment[len(old_segment) - 1 - suffix] == new_segment[len(new_segment) - 1 - suffix]
+        ):
+            suffix += 1
+
+        global_start = self.display_start + prefix
+        global_end = self.display_start + len(old_segment) - suffix
+        inserted = new_segment[prefix : len(new_segment) - suffix if suffix else len(new_segment)]
+        self.full_text = self.full_text[:global_start] + inserted + self.full_text[global_end:]
+        self.cursor = int(clamp(self.display_start + self.offset_from_index("insert"), 0, len(self.full_text)))
+        self.persist_cursor()
+        self.schedule_save()
+        self.render()
+
+    def sync_from_expanded_event(self, _event: tk.Event) -> None:
+        if self.expanded and not self._rendering:
+            self.sync_from_expanded(schedule=True)
+
+    def sync_from_expanded(self, schedule: bool = True) -> None:
+        if not self.expanded:
+            return
+        self.full_text = self.text.get("1.0", "end-1c")
+        self.cursor = int(clamp(self.offset_from_index("insert"), 0, len(self.full_text)))
+        self.persist_cursor()
+        if schedule:
+            self.schedule_save()
+
+    def offset_from_index(self, index: str) -> int:
+        count = self.text.count("1.0", index, "chars")
+        if not count:
+            return 0
+        return int(count[0])
+
+    def index_from_offset(self, offset: int) -> str:
+        safe_offset = int(clamp(offset, 0, len(self.full_text)))
+        return f"1.0 + {safe_offset} chars"
+
+    def copy_all(self, _event: tk.Event | None = None) -> str:
+        if self.expanded:
+            self.sync_from_expanded(schedule=False)
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self.full_text)
+        self.root.update()
+        return "break"
+
+    def clear_all(self, _event: tk.Event | None = None) -> str:
+        if not messagebox.askyesno("确认清空", "确定要清空全部已输入内容吗？此操作不可撤销。"):
+            return "break"
+        self.full_text = ""
+        self.cursor = 0
+        self.persist_cursor()
+        self.render()
+        self.schedule_save()
+        return "break"
+
+    def toggle_expanded(self, _event: tk.Event | None = None) -> str:
+        if self.expanded:
+            self.sync_from_expanded(schedule=False)
+            self.expanded = False
+        else:
+            self.expanded = True
+        self.settings["expanded"] = self.expanded
+        self.render()
+        self.schedule_save()
+        self.schedule_settings_save()
+        return "break"
+
+    def toggle_borderless(self, _event: tk.Event | None = None) -> str:
+        self.settings["borderless"] = not bool(self.settings["borderless"])
+        self.apply_chrome()
+        self.schedule_settings_save()
+        self.focus_editor()
+        return "break"
+
+    def set_borderless_from_toolbar(self) -> None:
+        self.settings["borderless"] = bool(self.borderless_var.get())
+        self.apply_chrome()
+        self.schedule_settings_save()
+
+    def toggle_topmost(self, _event: tk.Event | None = None) -> str:
+        self.settings["topmost"] = not bool(self.settings["topmost"])
+        self.apply_visual_settings()
+        return "break"
+
+    def set_topmost_from_toolbar(self) -> None:
+        self.settings["topmost"] = bool(self.topmost_var.get())
+        self.apply_visual_settings()
+
+    def set_opacity_from_toolbar(self, _value: str | None = None) -> None:
+        self.settings["opacity"] = float(clamp(self.opacity_var.get() / 100, 0.3, 1.0))
+        self.apply_visual_settings()
+
+    def adjust_opacity(self, delta: float) -> str:
+        self.settings["opacity"] = float(clamp(self.settings["opacity"] + delta, 0.3, 1.0))
+        self.apply_visual_settings()
+        return "break"
+
+    def set_font_size_from_toolbar(self) -> None:
+        self.settings["font_size"] = int(clamp(self.font_size_var.get(), 8, 72))
+        self.apply_visual_settings()
+
+    def adjust_font_size(self, delta: int) -> str:
+        self.settings["font_size"] = int(clamp(self.settings["font_size"] + delta, 8, 72))
+        self.apply_visual_settings()
+        return "break"
+
+    def set_visible_chars_from_toolbar(self) -> None:
+        self.settings["visible_chars"] = int(clamp(self.visible_chars_var.get(), 1, 5000))
+        self.apply_visual_settings()
+
+    def adjust_visible_chars(self, delta: int) -> str:
+        self.settings["visible_chars"] = int(clamp(self.settings["visible_chars"] + delta, 1, 5000))
+        self.apply_visual_settings()
+        return "break"
+
+    def start_drag(self, event: tk.Event) -> None:
+        self._drag_start = (event.x_root, event.y_root, self.root.winfo_x(), self.root.winfo_y())
+
+    def drag_window(self, event: tk.Event) -> None:
+        if not self._drag_start:
+            return
+        start_x, start_y, window_x, window_y = self._drag_start
+        new_x = window_x + event.x_root - start_x
+        new_y = window_y + event.y_root - start_y
+        self.root.geometry(f"+{new_x}+{new_y}")
+
+    def start_resize(self, event: tk.Event) -> None:
+        self._resize_start = (
+            event.x_root,
+            event.y_root,
+            self.root.winfo_width(),
+            self.root.winfo_height(),
+        )
+
+    def resize_window(self, event: tk.Event) -> None:
+        if not self._resize_start:
+            return
+        start_x, start_y, width, height = self._resize_start
+        new_width = max(180, width + event.x_root - start_x)
+        new_height = max(80, height + event.y_root - start_y)
+        self.root.geometry(f"{new_width}x{new_height}")
+
+    def on_configure(self, event: tk.Event) -> None:
+        if event.widget is not self.root:
+            return
+        if self._refreshing_taskbar_icon:
+            return
+        if self.root.state() == "iconic":
+            return
+        self.settings["geometry"] = self.root.geometry()
+        self.schedule_settings_save()
+
+    def on_map(self, event: tk.Event) -> None:
+        if event.widget is not self.root or not self._restore_borderless_after_minimize:
+            return
+        self._restore_borderless_after_minimize = False
+        self.root.after(80, self.restore_borderless_after_minimize)
+
+    def restore_borderless_after_minimize(self) -> None:
+        if self.root.state() == "iconic":
+            self._restore_borderless_after_minimize = True
+            return
+        self.settings["borderless"] = True
+        self.apply_chrome()
+        self.focus_editor()
+
+    def minimize_to_taskbar(self, _event: tk.Event | None = None) -> str:
+        if self.expanded:
+            self.sync_from_expanded(schedule=False)
+            self.schedule_save()
+        self._restore_borderless_after_minimize = bool(self.settings["borderless"])
+        if self._restore_borderless_after_minimize:
+            self.settings["borderless"] = False
+            self.apply_chrome()
+            self.root.update_idletasks()
+        self.root.iconify()
+        return "break"
+
+    def persist_cursor(self) -> None:
+        self.settings["cursor"] = int(clamp(self.cursor, 0, len(self.full_text)))
+        self.schedule_settings_save()
+
+    def schedule_save(self) -> None:
+        if self._save_after_id is not None:
+            self.root.after_cancel(self._save_after_id)
+        self._save_after_id = self.root.after(250, self.save_now)
+
+    def schedule_settings_save(self) -> None:
+        if self._settings_save_after_id is not None:
+            self.root.after_cancel(self._settings_save_after_id)
+        self._settings_save_after_id = self.root.after(250, self.save_settings_now)
+
+    def save_now(self) -> None:
+        self._save_after_id = None
+        write_text_atomic(HISTORY_PATH, self.full_text)
+        self.save_settings_now()
+
+    def save_settings_now(self) -> None:
+        self._settings_save_after_id = None
+        self.settings["expanded"] = bool(self.expanded)
+        self.settings["cursor"] = int(clamp(self.cursor, 0, len(self.full_text)))
+        write_text_atomic(SETTINGS_PATH, json.dumps(self.settings, ensure_ascii=False, indent=2))
+
+    def close(self) -> None:
+        if self.expanded:
+            self.sync_from_expanded(schedule=False)
+        if self._save_after_id is not None:
+            self.root.after_cancel(self._save_after_id)
+            self._save_after_id = None
+        if self._settings_save_after_id is not None:
+            self.root.after_cancel(self._settings_save_after_id)
+            self._settings_save_after_id = None
+        self.save_now()
+        self.root.destroy()
+
+    def close_from_shortcut(self, _event: tk.Event | None = None) -> str:
+        self.close()
+        return "break"
+
+    def run(self) -> None:
+        self.root.mainloop()
+
+
+if __name__ == "__main__":
+    PrivateTextWindow().run()
