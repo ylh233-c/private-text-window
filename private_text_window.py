@@ -7,11 +7,13 @@ import struct
 import sys
 import tkinter as tk
 from tkinter import messagebox
+from tkinter import simpledialog
 from tkinter import ttk
 
 
 APP_DIR = Path(__file__).resolve().parent
 HISTORY_PATH = APP_DIR / "history.txt"
+PAGES_PATH = APP_DIR / "pages.json"
 SETTINGS_PATH = APP_DIR / "settings.json"
 ICON_PATH = APP_DIR / "private_text_window.ico"
 IS_WINDOWS = sys.platform.startswith("win")
@@ -25,6 +27,7 @@ DEFAULT_SETTINGS = {
     "topmost": True,
     "geometry": "420x180+120+120",
     "cursor": 0,
+    "current_page_id": "page-1",
 }
 
 
@@ -70,6 +73,69 @@ def write_text_atomic(path: Path, content: str) -> None:
     tmp_path = path.with_name(path.name + ".tmp")
     tmp_path.write_text(content, encoding="utf-8")
     tmp_path.replace(path)
+
+
+def make_page(page_id: str, name: str, text: str = "", cursor: int = 0) -> dict:
+    safe_text = text if isinstance(text, str) else str(text)
+    safe_cursor = int(clamp(cursor, 0, len(safe_text)))
+    return {
+        "id": page_id,
+        "name": name.strip() or page_id,
+        "text": safe_text,
+        "cursor": safe_cursor,
+    }
+
+
+def load_pages(settings: dict) -> tuple[list[dict], str]:
+    if PAGES_PATH.exists():
+        try:
+            saved = json.loads(PAGES_PATH.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            saved = {}
+        pages, current_page_id = normalize_pages_data(saved)
+        if pages:
+            return pages, current_page_id
+
+    legacy_text = read_text(HISTORY_PATH)
+    legacy_cursor = coerce_int(settings.get("cursor"), 0)
+    page = make_page("page-1", "1", legacy_text, legacy_cursor)
+    return [page], page["id"]
+
+
+def normalize_pages_data(data: object) -> tuple[list[dict], str]:
+    if not isinstance(data, dict):
+        return [], "page-1"
+
+    raw_pages = data.get("pages")
+    if not isinstance(raw_pages, list):
+        return [], "page-1"
+
+    pages: list[dict] = []
+    used_ids: set[str] = set()
+    for index, raw_page in enumerate(raw_pages, start=1):
+        if not isinstance(raw_page, dict):
+            continue
+        page_id = str(raw_page.get("id") or f"page-{index}")
+        if page_id in used_ids:
+            page_id = f"page-{index}"
+        while page_id in used_ids:
+            page_id = f"page-{index}-{len(used_ids) + 1}"
+        used_ids.add(page_id)
+
+        name = str(raw_page.get("name") or index)
+        text = raw_page.get("text")
+        if not isinstance(text, str):
+            text = "" if text is None else str(text)
+        cursor = coerce_int(raw_page.get("cursor"), 0)
+        pages.append(make_page(page_id, name, text, cursor))
+
+    if not pages:
+        return [], "page-1"
+
+    current_page_id = str(data.get("current_page_id") or pages[0]["id"])
+    if not any(page["id"] == current_page_id for page in pages):
+        current_page_id = pages[0]["id"]
+    return pages, current_page_id
 
 
 def ensure_icon_file() -> None:
@@ -131,6 +197,7 @@ def load_settings() -> dict:
     settings["borderless"] = False
     settings["expanded"] = coerce_bool(settings.get("expanded"), False)
     settings["topmost"] = coerce_bool(settings.get("topmost"), True)
+    settings["current_page_id"] = str(settings.get("current_page_id") or DEFAULT_SETTINGS["current_page_id"])
     if not isinstance(settings.get("geometry"), str):
         settings["geometry"] = DEFAULT_SETTINGS["geometry"]
     return settings
@@ -139,8 +206,10 @@ def load_settings() -> dict:
 class PrivateTextWindow:
     def __init__(self) -> None:
         self.settings = load_settings()
-        self.full_text = read_text(HISTORY_PATH)
-        self.cursor = int(clamp(self.settings["cursor"], 0, len(self.full_text)))
+        self.pages, self.current_page_id = load_pages(self.settings)
+        self.full_text = ""
+        self.cursor = 0
+        self.load_current_page_to_buffer()
         self.expanded = bool(self.settings["expanded"])
         self.display_start = 0
         self._rendering = False
@@ -235,6 +304,8 @@ class PrivateTextWindow:
         self.opacity_var = tk.IntVar(value=round(self.settings["opacity"] * 100))
         self.font_size_var = tk.IntVar(value=self.settings["font_size"])
         self.visible_chars_var = tk.IntVar(value=self.settings["visible_chars"])
+        self.page_var = tk.StringVar()
+        self._page_options: list[str] = []
 
         ttk.Checkbutton(
             self.toolbar,
@@ -296,7 +367,26 @@ class PrivateTextWindow:
             row=0, column=10, padx=(0, 6), sticky="w"
         )
         ttk.Button(self.toolbar, text="清空", command=self.clear_all).grid(row=0, column=11, sticky="w")
+        ttk.Label(self.toolbar, text="页面").grid(row=1, column=0, padx=(0, 4), pady=(6, 0), sticky="e")
+        self.page_combo = ttk.Combobox(
+            self.toolbar,
+            textvariable=self.page_var,
+            state="readonly",
+            width=18,
+        )
+        self.page_combo.grid(row=1, column=1, columnspan=2, padx=(0, 10), pady=(6, 0), sticky="ew")
+        self.page_combo.bind("<<ComboboxSelected>>", self.switch_page_from_combo)
+        ttk.Button(self.toolbar, text="新建", command=self.new_page).grid(
+            row=1, column=3, padx=(0, 6), pady=(6, 0), sticky="w"
+        )
+        ttk.Button(self.toolbar, text="重命名", command=self.rename_current_page).grid(
+            row=1, column=4, padx=(0, 6), pady=(6, 0), sticky="w"
+        )
+        ttk.Button(self.toolbar, text="删除", command=self.delete_current_page).grid(
+            row=1, column=5, padx=(0, 6), pady=(6, 0), sticky="w"
+        )
         self.toolbar.grid_columnconfigure(3, weight=1)
+        self.refresh_page_controls()
 
     def bind_shortcuts(self) -> None:
         for sequence in ("<Control-b>", "<Control-B>"):
@@ -311,6 +401,16 @@ class PrivateTextWindow:
             self.root.bind_all(sequence, self.close_from_shortcut)
         for sequence in ("<Control-m>", "<Control-M>"):
             self.root.bind_all(sequence, self.minimize_to_taskbar)
+        for sequence in ("<Control-n>", "<Control-N>"):
+            self.root.bind_all(sequence, self.new_page)
+        for sequence in ("<Control-w>", "<Control-W>"):
+            self.root.bind_all(sequence, self.delete_current_page)
+        for sequence in ("<Control-r>", "<Control-R>"):
+            self.root.bind_all(sequence, self.rename_current_page)
+        self.root.bind_all("<Control-Tab>", self.next_page)
+        self.root.bind_all("<Control-Shift-Tab>", self.previous_page)
+        for page_number in range(1, 10):
+            self.root.bind_all(f"<Alt-Key-{page_number}>", self.switch_page_by_alt_number)
         self.root.bind_all("<Control-Up>", lambda _event: self.adjust_opacity(0.05))
         self.root.bind_all("<Control-Down>", lambda _event: self.adjust_opacity(-0.05))
         self.root.bind_all("<Control-plus>", lambda _event: self.adjust_font_size(1))
@@ -322,6 +422,151 @@ class PrivateTextWindow:
 
     def focus_editor(self, _event: tk.Event | None = None) -> None:
         self.text.focus_set()
+
+    def current_page(self) -> dict:
+        for page in self.pages:
+            if page["id"] == self.current_page_id:
+                return page
+        self.current_page_id = self.pages[0]["id"]
+        return self.pages[0]
+
+    def current_page_index(self) -> int:
+        for index, page in enumerate(self.pages):
+            if page["id"] == self.current_page_id:
+                return index
+        self.current_page_id = self.pages[0]["id"]
+        return 0
+
+    def load_current_page_to_buffer(self) -> None:
+        page = self.current_page()
+        self.full_text = page.get("text", "")
+        self.cursor = int(clamp(coerce_int(page.get("cursor"), 0), 0, len(self.full_text)))
+        page["cursor"] = self.cursor
+
+    def persist_current_page_from_buffer(self) -> None:
+        page = self.current_page()
+        self.cursor = int(clamp(self.cursor, 0, len(self.full_text)))
+        page["text"] = self.full_text
+        page["cursor"] = self.cursor
+
+    def sync_editor_before_page_change(self) -> None:
+        if self.expanded:
+            self.sync_from_expanded(schedule=False)
+        elif self.text.edit_modified():
+            self.sync_from_hidden_widget()
+            self.text.edit_modified(False)
+        self.persist_current_page_from_buffer()
+
+    def page_display_name(self, index: int, page: dict) -> str:
+        return f"{index + 1}. {page['name']}"
+
+    def refresh_page_controls(self) -> None:
+        self._page_options = [self.page_display_name(index, page) for index, page in enumerate(self.pages)]
+        self.page_combo.configure(values=self._page_options)
+        current_index = self.current_page_index()
+        self.page_var.set(self._page_options[current_index])
+
+    def switch_page_from_combo(self, _event: tk.Event | None = None) -> None:
+        selected = self.page_var.get()
+        if selected not in self._page_options:
+            self.refresh_page_controls()
+            return
+        self.switch_to_page_index(self._page_options.index(selected))
+
+    def switch_page_by_alt_number(self, event: tk.Event) -> str:
+        if event.keysym in {str(number) for number in range(1, 10)}:
+            self.switch_to_page_index(int(event.keysym) - 1)
+        return "break"
+
+    def switch_to_page_index(self, index: int) -> str:
+        if index < 0 or index >= len(self.pages):
+            return "break"
+        if index == self.current_page_index():
+            return "break"
+        self.sync_editor_before_page_change()
+        self.current_page_id = self.pages[index]["id"]
+        self.load_current_page_to_buffer()
+        self.settings["current_page_id"] = self.current_page_id
+        self.refresh_page_controls()
+        self.render()
+        self.schedule_save()
+        self.schedule_settings_save()
+        self.show_status(f"已切换到页面：{self.current_page()['name']}")
+        return "break"
+
+    def next_page(self, _event: tk.Event | None = None) -> str:
+        if not self.pages:
+            return "break"
+        return self.switch_to_page_index((self.current_page_index() + 1) % len(self.pages))
+
+    def previous_page(self, _event: tk.Event | None = None) -> str:
+        if not self.pages:
+            return "break"
+        return self.switch_to_page_index((self.current_page_index() - 1) % len(self.pages))
+
+    def next_page_id(self) -> str:
+        used_ids = {page["id"] for page in self.pages}
+        number = len(self.pages) + 1
+        while f"page-{number}" in used_ids:
+            number += 1
+        return f"page-{number}"
+
+    def next_page_name(self) -> str:
+        used_names = {page["name"] for page in self.pages}
+        number = 1
+        while str(number) in used_names:
+            number += 1
+        return str(number)
+
+    def new_page(self, _event: tk.Event | None = None) -> str:
+        self.sync_editor_before_page_change()
+        page = make_page(self.next_page_id(), self.next_page_name())
+        self.pages.append(page)
+        self.current_page_id = page["id"]
+        self.load_current_page_to_buffer()
+        self.settings["current_page_id"] = self.current_page_id
+        self.refresh_page_controls()
+        self.render()
+        self.schedule_save()
+        self.schedule_settings_save()
+        self.show_status(f"已新建页面：{page['name']}")
+        return "break"
+
+    def rename_current_page(self, _event: tk.Event | None = None) -> str:
+        page = self.current_page()
+        new_name = simpledialog.askstring("重命名页面", "请输入页面名称：", initialvalue=page["name"], parent=self.root)
+        if new_name is None:
+            return "break"
+        new_name = new_name.strip()
+        if not new_name:
+            messagebox.showinfo("无法重命名", "页面名称不能为空。")
+            return "break"
+        page["name"] = new_name
+        self.refresh_page_controls()
+        self.schedule_save()
+        self.show_status(f"已重命名页面：{new_name}")
+        self.focus_editor()
+        return "break"
+
+    def delete_current_page(self, _event: tk.Event | None = None) -> str:
+        if len(self.pages) <= 1:
+            messagebox.showinfo("无法删除", "至少需要保留一个页面。")
+            return "break"
+        current_index = self.current_page_index()
+        page = self.current_page()
+        if not messagebox.askyesno("确认删除页面", f"确定要删除页面“{page['name']}”吗？此操作不可撤销。"):
+            return "break"
+        del self.pages[current_index]
+        new_index = min(current_index, len(self.pages) - 1)
+        self.current_page_id = self.pages[new_index]["id"]
+        self.load_current_page_to_buffer()
+        self.settings["current_page_id"] = self.current_page_id
+        self.refresh_page_controls()
+        self.render()
+        self.schedule_save()
+        self.schedule_settings_save()
+        self.show_status("已删除页面")
+        return "break"
 
     def apply_chrome(self) -> None:
         borderless = bool(self.settings["borderless"])
@@ -472,6 +717,24 @@ class PrivateTextWindow:
         if ctrl and lower == "q":
             self.close()
             return "break"
+        if ctrl and lower == "n":
+            self.new_page()
+            return "break"
+        if ctrl and lower == "w":
+            self.delete_current_page()
+            return "break"
+        if ctrl and lower == "r":
+            self.rename_current_page()
+            return "break"
+        if ctrl and keysym == "Tab":
+            if shift:
+                self.previous_page()
+            else:
+                self.next_page()
+            return "break"
+        if self.has_alt(event) and keysym in {str(number) for number in range(1, 10)}:
+            self.switch_to_page_index(int(keysym) - 1)
+            return "break"
         if ctrl and keysym == "Up":
             self.adjust_opacity(0.05)
             return "break"
@@ -500,6 +763,9 @@ class PrivateTextWindow:
 
     def has_shift(self, event: tk.Event) -> bool:
         return bool(int(event.state) & 0x0001)
+
+    def has_alt(self, event: tk.Event) -> bool:
+        return bool(int(event.state) & 0x0008)
 
     def has_ctrl_or_alt(self, event: tk.Event) -> bool:
         state = int(event.state)
@@ -594,6 +860,7 @@ class PrivateTextWindow:
         inserted = new_segment[prefix : len(new_segment) - suffix if suffix else len(new_segment)]
         self.full_text = self.full_text[:global_start] + inserted + self.full_text[global_end:]
         self.cursor = int(clamp(self.display_start + self.offset_from_index("insert"), 0, len(self.full_text)))
+        self.persist_current_page_from_buffer()
         self.persist_cursor()
         self.schedule_save()
         self.render()
@@ -607,6 +874,7 @@ class PrivateTextWindow:
             return
         self.full_text = self.text.get("1.0", "end-1c")
         self.cursor = int(clamp(self.offset_from_index("insert"), 0, len(self.full_text)))
+        self.persist_current_page_from_buffer()
         self.persist_cursor()
         if schedule:
             self.schedule_save()
@@ -648,6 +916,7 @@ class PrivateTextWindow:
             return "break"
         self.full_text = ""
         self.cursor = 0
+        self.persist_current_page_from_buffer()
         self.persist_cursor()
         self.render()
         self.schedule_save()
@@ -778,6 +1047,9 @@ class PrivateTextWindow:
 
     def persist_cursor(self) -> None:
         self.settings["cursor"] = int(clamp(self.cursor, 0, len(self.full_text)))
+        self.settings["current_page_id"] = self.current_page_id
+        self.persist_current_page_from_buffer()
+        self.schedule_save()
         self.schedule_settings_save()
 
     def schedule_save(self) -> None:
@@ -792,13 +1064,20 @@ class PrivateTextWindow:
 
     def save_now(self) -> None:
         self._save_after_id = None
-        write_text_atomic(HISTORY_PATH, self.full_text)
+        self.persist_current_page_from_buffer()
+        data = {
+            "version": 1,
+            "current_page_id": self.current_page_id,
+            "pages": self.pages,
+        }
+        write_text_atomic(PAGES_PATH, json.dumps(data, ensure_ascii=False, indent=2))
         self.save_settings_now()
 
     def save_settings_now(self) -> None:
         self._settings_save_after_id = None
         self.settings["expanded"] = bool(self.expanded)
         self.settings["cursor"] = int(clamp(self.cursor, 0, len(self.full_text)))
+        self.settings["current_page_id"] = self.current_page_id
         write_text_atomic(SETTINGS_PATH, json.dumps(self.settings, ensure_ascii=False, indent=2))
 
     def close(self) -> None:
