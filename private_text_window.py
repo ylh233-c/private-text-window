@@ -28,7 +28,13 @@ DEFAULT_SETTINGS = {
     "geometry": "420x180+120+120",
     "cursor": 0,
     "current_page_id": "page-1",
+    "grip_shade": 17,
+    "borderless_outline": False,
 }
+
+MIN_WINDOW_WIDTH = 96
+MIN_TEXT_WIDTH = 56
+RESIZE_GRIP_SIZE = 16
 
 
 def clamp(value: int | float, low: int | float, high: int | float) -> int | float:
@@ -198,6 +204,8 @@ def load_settings() -> dict:
     settings["expanded"] = coerce_bool(settings.get("expanded"), False)
     settings["topmost"] = coerce_bool(settings.get("topmost"), True)
     settings["current_page_id"] = str(settings.get("current_page_id") or DEFAULT_SETTINGS["current_page_id"])
+    settings["grip_shade"] = int(clamp(coerce_int(settings.get("grip_shade"), 17), 0, 100))
+    settings["borderless_outline"] = coerce_bool(settings.get("borderless_outline"), False)
     if not isinstance(settings.get("geometry"), str):
         settings["geometry"] = DEFAULT_SETTINGS["geometry"]
     return settings
@@ -216,12 +224,18 @@ class PrivateTextWindow:
         self._save_after_id: str | None = None
         self._settings_save_after_id: str | None = None
         self._status_after_id: str | None = None
+        self._visible_chars_after_id: str | None = None
         self._drag_start: tuple[int, int, int, int] | None = None
         self._resize_start: tuple[int, int, int, int] | None = None
         self._restore_borderless_after_minimize = False
         self._refreshing_taskbar_icon = False
+        self.quick_panel: tk.Toplevel | None = None
+        self.quick_page_combo: ttk.Combobox | None = None
 
         self.root = tk.Tk()
+        self.grip_shade_var = tk.IntVar(value=self.settings["grip_shade"])
+        self.borderless_outline_var = tk.BooleanVar(value=self.settings["borderless_outline"])
+        self.expanded_var = tk.BooleanVar(value=self.expanded)
         self.root.title("Private Text")
         self.set_window_icon()
         try:
@@ -229,7 +243,7 @@ class PrivateTextWindow:
         except tk.TclError:
             self.settings["geometry"] = DEFAULT_SETTINGS["geometry"]
             self.root.geometry(DEFAULT_SETTINGS["geometry"])
-        self.root.minsize(180, 80)
+        self.apply_window_minsize()
         self.root.configure(bg="white")
         self.root.attributes("-alpha", self.settings["opacity"])
         self.root.attributes("-topmost", self.settings["topmost"])
@@ -256,7 +270,7 @@ class PrivateTextWindow:
             wrap="char",
             undo=True,
             padx=8,
-            pady=8,
+            pady=6,
             font=self.font,
         )
         self.text.pack(fill="both", expand=True)
@@ -270,9 +284,15 @@ class PrivateTextWindow:
         self.root.bind("<Configure>", self.on_configure)
         self.root.bind("<Map>", self.on_map)
 
-        self.resize_grip = tk.Frame(self.root, bg="#e9e9e9", cursor="size_nw_se")
+        self.resize_grip = tk.Frame(self.root, bg=self.grip_color(), cursor="size_nw_se")
         self.resize_grip.bind("<ButtonPress-1>", self.start_resize)
         self.resize_grip.bind("<B1-Motion>", self.resize_window)
+        self.resize_grip.bind("<Double-Button-1>", self.show_quick_panel)
+        self.resize_grip.bind("<Button-3>", self.show_quick_panel)
+        self.outline_top = tk.Frame(self.root, bg="#b8b8b8")
+        self.outline_bottom = tk.Frame(self.root, bg="#b8b8b8")
+        self.outline_left = tk.Frame(self.root, bg="#b8b8b8")
+        self.outline_right = tk.Frame(self.root, bg="#b8b8b8")
 
         self.status_label = tk.Label(
             self.root,
@@ -284,8 +304,8 @@ class PrivateTextWindow:
             pady=2,
             font=("Microsoft YaHei UI", 9),
         )
-
         self.bind_shortcuts()
+        self.root.bind_all("<Button-1>", self.close_quick_panel_on_outside, add="+")
         self.apply_chrome()
         self.render()
         self.root.after(50, self.focus_editor)
@@ -297,6 +317,283 @@ class PrivateTextWindow:
             self.root.iconbitmap(str(ICON_PATH))
         except (OSError, tk.TclError):
             pass
+
+    def min_window_height(self) -> int:
+        font_size = int(clamp(coerce_int(self.settings.get("font_size"), 18), 8, 72))
+        text_line_height = round(font_size * 1.55)
+        text_padding = 18
+        drag_strip_height = 8
+        outline_allowance = 4
+        return max(48, text_line_height + text_padding + drag_strip_height + outline_allowance)
+
+    def min_window_width(self) -> int:
+        return max(MIN_WINDOW_WIDTH, MIN_TEXT_WIDTH + RESIZE_GRIP_SIZE + 24)
+
+    def apply_window_minsize(self) -> None:
+        self.root.minsize(self.min_window_width(), self.min_window_height())
+
+    def grip_color(self) -> str:
+        shade = int(clamp(coerce_int(self.settings.get("grip_shade"), 17), 0, 100))
+        channel = 250 - round(shade * 1.45)
+        channel = int(clamp(channel, 105, 250))
+        return f"#{channel:02x}{channel:02x}{channel:02x}"
+
+    def apply_grip_shade(self) -> None:
+        self.settings["grip_shade"] = int(clamp(coerce_int(self.settings.get("grip_shade"), 17), 0, 100))
+        self.grip_shade_var.set(self.settings["grip_shade"])
+        self.resize_grip.configure(bg=self.grip_color())
+        self.schedule_settings_save()
+
+    def apply_borderless_outline(self) -> None:
+        for frame in (self.outline_top, self.outline_bottom, self.outline_left, self.outline_right):
+            frame.place_forget()
+        if not self.settings["borderless"] or not self.settings["borderless_outline"]:
+            return
+
+        thickness = 2
+        self.outline_top.place(x=0, y=0, relwidth=1.0, height=thickness)
+        self.outline_bottom.place(x=0, rely=1.0, relwidth=1.0, height=thickness, anchor="sw")
+        self.outline_left.place(x=0, y=0, width=thickness, relheight=1.0)
+        self.outline_right.place(relx=1.0, y=0, width=thickness, relheight=1.0, anchor="ne")
+        for frame in (self.outline_top, self.outline_bottom, self.outline_left, self.outline_right):
+            frame.lift()
+        self.resize_grip.lift()
+
+    def show_quick_panel(self, event: tk.Event) -> str:
+        if not self.settings["borderless"]:
+            return "break"
+        self._resize_start = None
+        if self.quick_panel is None or not self.quick_panel.winfo_exists():
+            self.quick_panel = self.build_quick_panel()
+        self.position_quick_panel(event.x_root, event.y_root)
+        self.quick_panel.deiconify()
+        self.quick_panel.lift()
+        self.quick_panel.focus_force()
+        return "break"
+
+    def build_quick_panel(self) -> tk.Toplevel:
+        panel = tk.Toplevel(self.root)
+        panel.title("常用功能")
+        panel.overrideredirect(True)
+        panel.configure(bg="#f7f7f7")
+        panel.attributes("-topmost", True)
+
+        header = tk.Frame(panel, bg="#f7f7f7")
+        header.grid(row=0, column=0, columnspan=2, sticky="ew", padx=6, pady=(6, 6))
+        tk.Label(header, text="常用功能", bg="#f7f7f7", fg="#222222", font=("Microsoft YaHei UI", 9, "bold")).pack(
+            side="left"
+        )
+        ttk.Button(header, text="关闭", command=self.close_quick_panel).pack(side="right")
+
+        ttk.Label(panel, text="当前页面", background="#f7f7f7").grid(row=1, column=0, padx=3, pady=(0, 6), sticky="w")
+        self.quick_page_combo = ttk.Combobox(
+            panel,
+            textvariable=self.page_var,
+            state="readonly",
+            width=14,
+        )
+        self.quick_page_combo.grid(row=1, column=1, padx=3, pady=(0, 6), sticky="w")
+        self.quick_page_combo.bind("<<ComboboxSelected>>", self.switch_page_from_combo)
+        self.refresh_page_controls()
+
+        actions = [
+            ("复制当前页", self.copy_all),
+            ("清空当前页", self.clear_all),
+            ("新建页面", self.new_page),
+            ("重命名", self.rename_current_page),
+            ("删除页面", self.delete_current_page),
+            ("上一页", self.previous_page),
+            ("下一页", self.next_page),
+            ("字号 +", lambda: self.adjust_font_size(1)),
+            ("字号 -", lambda: self.adjust_font_size(-1)),
+            ("显示字数 +", lambda: self.adjust_visible_chars(5)),
+            ("显示字数 -", lambda: self.adjust_visible_chars(-5)),
+            ("透明度 +", lambda: self.adjust_opacity(0.05)),
+            ("透明度 -", lambda: self.adjust_opacity(-0.05)),
+            ("有边框设置栏", self.toggle_borderless),
+            ("快捷键", self.show_shortcut_summary),
+            ("退出", self.close),
+        ]
+        for index, (label, command) in enumerate(actions):
+            row = 2 + index // 2
+            column = index % 2
+            ttk.Button(panel, text=label, width=12, command=command).grid(row=row, column=column, padx=3, pady=3)
+
+        shade_row = 2 + (len(actions) + 1) // 2
+        ttk.Label(panel, text="显示字数", background="#f7f7f7").grid(
+            row=shade_row,
+            column=0,
+            padx=3,
+            pady=(8, 3),
+            sticky="w",
+        )
+        ttk.Button(panel, text="-", width=3, command=lambda: self.adjust_visible_chars(-5)).grid(
+            row=shade_row,
+            column=1,
+            padx=3,
+            pady=(8, 3),
+            sticky="w",
+        )
+        ttk.Button(panel, text="+", width=3, command=lambda: self.adjust_visible_chars(5)).grid(
+            row=shade_row,
+            column=1,
+            padx=(42, 3),
+            pady=(8, 3),
+            sticky="w",
+        )
+        visible_spin = ttk.Spinbox(
+            panel,
+            from_=1,
+            to=5000,
+            textvariable=self.visible_chars_var,
+            width=8,
+            command=self.set_visible_chars_from_toolbar,
+        )
+        visible_spin.grid(row=shade_row + 1, column=0, columnspan=2, padx=3, pady=(0, 3), sticky="w")
+        visible_spin.bind("<KeyRelease>", self.schedule_visible_chars_from_input)
+        visible_spin.bind("<Return>", lambda _event: self.set_visible_chars_from_toolbar())
+        visible_spin.bind("<FocusOut>", lambda _event: self.set_visible_chars_from_toolbar())
+
+        shade_row += 2
+        toggle_frame = tk.Frame(panel, bg="#f7f7f7")
+        toggle_frame.grid(row=shade_row, column=0, columnspan=2, padx=3, pady=(8, 3), sticky="w")
+        ttk.Checkbutton(
+            toggle_frame,
+            text="展开当前页",
+            variable=self.expanded_var,
+            command=self.set_expanded_from_panel,
+        ).pack(side="left", padx=(0, 8))
+        ttk.Checkbutton(
+            toggle_frame,
+            text="置顶窗口",
+            variable=self.topmost_var,
+            command=self.set_topmost_from_toolbar,
+        ).pack(side="left", padx=(0, 8))
+        ttk.Checkbutton(
+            toggle_frame,
+            text="增强边界线",
+            variable=self.borderless_outline_var,
+            command=self.set_borderless_outline_from_panel,
+        ).pack(side="left")
+
+        shade_row += 1
+        ttk.Label(panel, text="方块深浅", background="#f7f7f7").grid(
+            row=shade_row,
+            column=0,
+            padx=3,
+            pady=(8, 3),
+            sticky="w",
+        )
+        ttk.Button(panel, text="-", width=3, command=lambda: self.adjust_grip_shade(-5)).grid(
+            row=shade_row,
+            column=1,
+            padx=3,
+            pady=(8, 3),
+            sticky="w",
+        )
+        ttk.Button(panel, text="+", width=3, command=lambda: self.adjust_grip_shade(5)).grid(
+            row=shade_row,
+            column=1,
+            padx=(42, 3),
+            pady=(8, 3),
+            sticky="w",
+        )
+        ttk.Scale(
+            panel,
+            from_=0,
+            to=100,
+            orient="horizontal",
+            variable=self.grip_shade_var,
+            command=self.set_grip_shade_from_panel,
+            length=130,
+        ).grid(row=shade_row + 1, column=0, columnspan=2, padx=3, pady=(0, 3), sticky="ew")
+
+        panel.grid_columnconfigure(0, minsize=132)
+        panel.grid_columnconfigure(1, minsize=132)
+        panel.bind("<Escape>", lambda _event: self.close_quick_panel())
+        panel.withdraw()
+        return panel
+
+    def position_quick_panel(self, x_root: int, y_root: int) -> None:
+        if self.quick_panel is None:
+            return
+        self.quick_panel.update_idletasks()
+        width = self.quick_panel.winfo_reqwidth()
+        height = self.quick_panel.winfo_reqheight()
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        margin = 8
+        root_x = self.root.winfo_rootx()
+        root_y = self.root.winfo_rooty()
+        root_width = self.root.winfo_width()
+        root_height = self.root.winfo_height()
+        right_x = root_x + root_width + margin
+        left_x = root_x - width - margin
+
+        if right_x + width <= screen_width:
+            x = right_x
+        elif left_x >= 0:
+            x = left_x
+        else:
+            x = int(clamp(x_root - width + 12, 0, max(0, screen_width - width)))
+
+        preferred_y = root_y + max(0, (root_height - height) // 2)
+        y = int(clamp(preferred_y, 0, max(0, screen_height - height)))
+        self.quick_panel.geometry(f"+{x}+{y}")
+
+    def close_quick_panel(self) -> None:
+        if self.quick_panel is not None and self.quick_panel.winfo_exists():
+            self.quick_panel.withdraw()
+
+    def close_quick_panel_on_outside(self, event: tk.Event) -> None:
+        if self.quick_panel is None or not self.quick_panel.winfo_exists() or not self.quick_panel.winfo_viewable():
+            return
+        if event.widget.winfo_toplevel() is self.quick_panel:
+            return
+        if event.widget is self.resize_grip:
+            return
+        self.close_quick_panel()
+
+    def set_grip_shade_from_panel(self, _value: str | None = None) -> None:
+        self.settings["grip_shade"] = int(clamp(self.grip_shade_var.get(), 0, 100))
+        self.apply_grip_shade()
+
+    def adjust_grip_shade(self, delta: int) -> str:
+        self.settings["grip_shade"] = int(clamp(self.settings["grip_shade"] + delta, 0, 100))
+        self.apply_grip_shade()
+        return "break"
+
+    def set_borderless_outline_from_panel(self) -> None:
+        self.settings["borderless_outline"] = bool(self.borderless_outline_var.get())
+        self.apply_borderless_outline()
+        self.schedule_settings_save()
+
+    def show_shortcut_summary(self) -> None:
+        messagebox.showinfo(
+            "快捷键汇总",
+            "\n".join(
+                [
+                    "Ctrl+B：切换无边框 / 有边框设置栏",
+                    "Ctrl+E：展开 / 收起当前页",
+                    "Ctrl+N：新建页面",
+                    "Ctrl+W：删除当前页面",
+                    "Ctrl+R：重命名当前页面",
+                    "Ctrl+Tab / Ctrl+Shift+Tab：下一页 / 上一页",
+                    "Alt+1 到 Alt+9：切换第 1-9 页",
+                    "隐藏模式 Ctrl+C：复制当前页全部内容",
+                    "任意模式 Ctrl+Shift+C：复制当前页全部内容",
+                    "Ctrl+Shift+Delete：清空当前页内容",
+                    "Ctrl+M：最小化到任务栏",
+                    "Ctrl+T：切换置顶",
+                    "Ctrl+Up / Ctrl+Down：提高 / 降低透明度",
+                    "Ctrl+= / Ctrl+-：增大 / 减小字体",
+                    "隐藏模式 Ctrl+Right / Ctrl+Left：增加 / 减少显示字数",
+                    "隐藏模式 Left / Right：移动输入光标",
+                ]
+            ),
+            parent=self.root,
+        )
+        self.focus_editor()
 
     def _build_toolbar(self) -> None:
         self.borderless_var = tk.BooleanVar(value=self.settings["borderless"])
@@ -354,6 +651,7 @@ class PrivateTextWindow:
             command=self.set_visible_chars_from_toolbar,
         )
         visible_spin.grid(row=0, column=7, padx=(0, 12), sticky="w")
+        visible_spin.bind("<KeyRelease>", self.schedule_visible_chars_from_input)
         visible_spin.bind("<Return>", lambda _event: self.set_visible_chars_from_toolbar())
         visible_spin.bind("<FocusOut>", lambda _event: self.set_visible_chars_from_toolbar())
 
@@ -463,6 +761,8 @@ class PrivateTextWindow:
     def refresh_page_controls(self) -> None:
         self._page_options = [self.page_display_name(index, page) for index, page in enumerate(self.pages)]
         self.page_combo.configure(values=self._page_options)
+        if self.quick_page_combo is not None and self.quick_page_combo.winfo_exists():
+            self.quick_page_combo.configure(values=self._page_options)
         current_index = self.current_page_index()
         self.page_var.set(self._page_options[current_index])
 
@@ -581,7 +881,9 @@ class PrivateTextWindow:
             self.drag_strip.pack(side="top", fill="x", before=self.text)
             self.resize_grip.place(relx=1.0, rely=1.0, anchor="se", width=16, height=16)
         else:
+            self.close_quick_panel()
             self.toolbar.pack(side="top", fill="x", before=self.text)
+        self.apply_borderless_outline()
         self.root.after(20, self.root.update_idletasks)
         self.root.after(60, lambda: self.force_taskbar_icon(refresh=borderless))
 
@@ -636,6 +938,7 @@ class PrivateTextWindow:
         self.settings["visible_chars"] = int(clamp(int(self.settings["visible_chars"]), 1, 5000))
         self.settings["opacity"] = float(clamp(float(self.settings["opacity"]), 0.3, 1.0))
         self.font = ("Microsoft YaHei UI", self.settings["font_size"])
+        self.apply_window_minsize()
         self.text.configure(font=self.font)
         self.root.attributes("-alpha", self.settings["opacity"])
         self.root.attributes("-topmost", self.settings["topmost"])
@@ -643,6 +946,7 @@ class PrivateTextWindow:
         self.font_size_var.set(self.settings["font_size"])
         self.visible_chars_var.set(self.settings["visible_chars"])
         self.topmost_var.set(self.settings["topmost"])
+        self.expanded_var.set(self.expanded)
         self.render()
         self.schedule_settings_save()
 
@@ -923,16 +1227,24 @@ class PrivateTextWindow:
         return "break"
 
     def toggle_expanded(self, _event: tk.Event | None = None) -> str:
+        self.set_expanded_state(not self.expanded)
+        return "break"
+
+    def set_expanded_from_panel(self) -> None:
+        self.set_expanded_state(bool(self.expanded_var.get()))
+
+    def set_expanded_state(self, expanded: bool) -> None:
+        if expanded == self.expanded:
+            self.expanded_var.set(self.expanded)
+            return
         if self.expanded:
             self.sync_from_expanded(schedule=False)
-            self.expanded = False
-        else:
-            self.expanded = True
+        self.expanded = expanded
         self.settings["expanded"] = self.expanded
+        self.expanded_var.set(self.expanded)
         self.render()
         self.schedule_save()
         self.schedule_settings_save()
-        return "break"
 
     def toggle_borderless(self, _event: tk.Event | None = None) -> str:
         self.settings["borderless"] = not bool(self.settings["borderless"])
@@ -973,12 +1285,31 @@ class PrivateTextWindow:
         self.apply_visual_settings()
         return "break"
 
-    def set_visible_chars_from_toolbar(self) -> None:
-        self.settings["visible_chars"] = int(clamp(self.visible_chars_var.get(), 1, 5000))
+    def set_visible_chars_from_toolbar(self, _value: str | None = None) -> None:
+        try:
+            value = int(self.visible_chars_var.get())
+        except (tk.TclError, ValueError):
+            return
+        self.settings["visible_chars"] = int(clamp(value, 1, 5000))
+        self.visible_chars_var.set(self.settings["visible_chars"])
+        if self.expanded:
+            self.set_expanded_state(False)
         self.apply_visual_settings()
+
+    def schedule_visible_chars_from_input(self, _event: tk.Event | None = None) -> None:
+        if self._visible_chars_after_id is not None:
+            self.root.after_cancel(self._visible_chars_after_id)
+        self._visible_chars_after_id = self.root.after(120, self.apply_visible_chars_from_input)
+
+    def apply_visible_chars_from_input(self) -> None:
+        self._visible_chars_after_id = None
+        self.set_visible_chars_from_toolbar()
 
     def adjust_visible_chars(self, delta: int) -> str:
         self.settings["visible_chars"] = int(clamp(self.settings["visible_chars"] + delta, 1, 5000))
+        self.visible_chars_var.set(self.settings["visible_chars"])
+        if self.expanded:
+            self.set_expanded_state(False)
         self.apply_visual_settings()
         return "break"
 
@@ -1005,8 +1336,8 @@ class PrivateTextWindow:
         if not self._resize_start:
             return
         start_x, start_y, width, height = self._resize_start
-        new_width = max(180, width + event.x_root - start_x)
-        new_height = max(80, height + event.y_root - start_y)
+        new_width = max(self.min_window_width(), width + event.x_root - start_x)
+        new_height = max(self.min_window_height(), height + event.y_root - start_y)
         self.root.geometry(f"{new_width}x{new_height}")
 
     def on_configure(self, event: tk.Event) -> None:
@@ -1078,6 +1409,7 @@ class PrivateTextWindow:
         self.settings["expanded"] = bool(self.expanded)
         self.settings["cursor"] = int(clamp(self.cursor, 0, len(self.full_text)))
         self.settings["current_page_id"] = self.current_page_id
+        self.settings["borderless_outline"] = bool(self.settings["borderless_outline"])
         write_text_atomic(SETTINGS_PATH, json.dumps(self.settings, ensure_ascii=False, indent=2))
 
     def close(self) -> None:
@@ -1092,6 +1424,12 @@ class PrivateTextWindow:
         if self._status_after_id is not None:
             self.root.after_cancel(self._status_after_id)
             self._status_after_id = None
+        if self._visible_chars_after_id is not None:
+            self.root.after_cancel(self._visible_chars_after_id)
+            self._visible_chars_after_id = None
+        if self.quick_panel is not None and self.quick_panel.winfo_exists():
+            self.quick_panel.destroy()
+            self.quick_panel = None
         self.save_now()
         self.root.destroy()
 
