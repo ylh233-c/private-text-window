@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 import ctypes
 import json
 from pathlib import Path
@@ -17,6 +18,9 @@ PAGES_PATH = APP_DIR / "pages.json"
 SETTINGS_PATH = APP_DIR / "settings.json"
 ICON_PATH = APP_DIR / "private_text_window.ico"
 IS_WINDOWS = sys.platform.startswith("win")
+VK_SHIFT = 0x10
+VK_CONTROL = 0x11
+VK_MENU = 0x12
 
 DEFAULT_SETTINGS = {
     "opacity": 0.92,
@@ -67,6 +71,15 @@ def coerce_bool(value: object, default: bool) -> bool:
     if isinstance(value, (int, float)):
         return bool(value)
     return default
+
+
+def is_virtual_key_down(virtual_key: int) -> bool:
+    if not IS_WINDOWS:
+        return False
+    try:
+        return bool(ctypes.windll.user32.GetKeyState(virtual_key) & 0x8000)
+    except (AttributeError, OSError):
+        return False
 
 
 def read_text(path: Path) -> str:
@@ -687,36 +700,46 @@ class PrivateTextWindow:
         self.refresh_page_controls()
 
     def bind_shortcuts(self) -> None:
+        def bind_ctrl(
+            sequence: str,
+            command: Callable[[tk.Event], str | None],
+            shift_required: bool = False,
+        ) -> None:
+            def handle_event(event: tk.Event) -> str | None:
+                return self.run_ctrl_shortcut(event, command, shift_required)
+
+            self.root.bind_all(sequence, handle_event)
+
         for sequence in ("<Control-b>", "<Control-B>"):
-            self.root.bind_all(sequence, self.toggle_borderless)
+            bind_ctrl(sequence, self.toggle_borderless)
         for sequence in ("<Control-e>", "<Control-E>"):
-            self.root.bind_all(sequence, self.toggle_expanded)
+            bind_ctrl(sequence, self.toggle_expanded)
         for sequence in ("<Control-Shift-c>", "<Control-Shift-C>"):
-            self.root.bind_all(sequence, self.copy_all)
+            bind_ctrl(sequence, self.copy_all, shift_required=True)
         for sequence in ("<Control-t>", "<Control-T>"):
-            self.root.bind_all(sequence, self.toggle_topmost)
+            bind_ctrl(sequence, self.toggle_topmost)
         for sequence in ("<Control-q>", "<Control-Q>"):
-            self.root.bind_all(sequence, self.close_from_shortcut)
+            bind_ctrl(sequence, self.close_from_shortcut)
         for sequence in ("<Control-m>", "<Control-M>"):
-            self.root.bind_all(sequence, self.minimize_to_taskbar)
+            bind_ctrl(sequence, self.minimize_to_taskbar)
         for sequence in ("<Control-n>", "<Control-N>"):
-            self.root.bind_all(sequence, self.new_page)
+            bind_ctrl(sequence, self.new_page)
         for sequence in ("<Control-w>", "<Control-W>"):
-            self.root.bind_all(sequence, self.delete_current_page)
+            bind_ctrl(sequence, self.delete_current_page)
         for sequence in ("<Control-r>", "<Control-R>"):
-            self.root.bind_all(sequence, self.rename_current_page)
-        self.root.bind_all("<Control-Tab>", self.next_page)
-        self.root.bind_all("<Control-Shift-Tab>", self.previous_page)
+            bind_ctrl(sequence, self.rename_current_page)
+        bind_ctrl("<Control-Tab>", self.next_page)
+        bind_ctrl("<Control-Shift-Tab>", self.previous_page, shift_required=True)
         for page_number in range(1, 10):
             self.root.bind_all(f"<Alt-Key-{page_number}>", self.switch_page_by_alt_number)
-        self.root.bind_all("<Control-Up>", lambda _event: self.adjust_opacity(0.05))
-        self.root.bind_all("<Control-Down>", lambda _event: self.adjust_opacity(-0.05))
-        self.root.bind_all("<Control-plus>", lambda _event: self.adjust_font_size(1))
-        self.root.bind_all("<Control-equal>", lambda _event: self.adjust_font_size(1))
-        self.root.bind_all("<Control-KP_Add>", lambda _event: self.adjust_font_size(1))
-        self.root.bind_all("<Control-minus>", lambda _event: self.adjust_font_size(-1))
-        self.root.bind_all("<Control-KP_Subtract>", lambda _event: self.adjust_font_size(-1))
-        self.root.bind_all("<Control-Shift-Delete>", self.clear_all)
+        bind_ctrl("<Control-Up>", lambda _event: self.adjust_opacity(0.05))
+        bind_ctrl("<Control-Down>", lambda _event: self.adjust_opacity(-0.05))
+        bind_ctrl("<Control-plus>", lambda _event: self.adjust_font_size(1))
+        bind_ctrl("<Control-equal>", lambda _event: self.adjust_font_size(1))
+        bind_ctrl("<Control-KP_Add>", lambda _event: self.adjust_font_size(1))
+        bind_ctrl("<Control-minus>", lambda _event: self.adjust_font_size(-1))
+        bind_ctrl("<Control-KP_Subtract>", lambda _event: self.adjust_font_size(-1))
+        bind_ctrl("<Control-Shift-Delete>", self.clear_all, shift_required=True)
 
     def focus_editor(self, _event: tk.Event | None = None) -> None:
         self.text.focus_set()
@@ -766,6 +789,18 @@ class PrivateTextWindow:
         current_index = self.current_page_index()
         self.page_var.set(self._page_options[current_index])
 
+    def run_ctrl_shortcut(
+        self,
+        event: tk.Event,
+        command: Callable[[tk.Event], str | None],
+        shift_required: bool = False,
+    ) -> str | None:
+        if not self.has_ctrl(event):
+            return None
+        if shift_required and not self.has_shift(event):
+            return None
+        return command(event)
+
     def switch_page_from_combo(self, _event: tk.Event | None = None) -> None:
         selected = self.page_var.get()
         if selected not in self._page_options:
@@ -773,10 +808,18 @@ class PrivateTextWindow:
             return
         self.switch_to_page_index(self._page_options.index(selected))
 
-    def switch_page_by_alt_number(self, event: tk.Event) -> str:
-        if event.keysym in {str(number) for number in range(1, 10)}:
+    def is_alt_number_shortcut(self, event: tk.Event) -> bool:
+        keysym = getattr(event, "keysym", "")
+        char = getattr(event, "char", "")
+        # Some Windows IME candidate commits report state bit 0x0008 with a numeric keysym.
+        # Treat Alt+number as a shortcut only when Alt is physically down and no text is being committed.
+        return self.has_alt(event) and keysym in {str(number) for number in range(1, 10)} and char in {"", keysym}
+
+    def switch_page_by_alt_number(self, event: tk.Event) -> str | None:
+        if self.is_alt_number_shortcut(event):
             self.switch_to_page_index(int(event.keysym) - 1)
-        return "break"
+            return "break"
+        return None
 
     def switch_to_page_index(self, index: int) -> str:
         if index < 0 or index >= len(self.pages):
@@ -1036,7 +1079,7 @@ class PrivateTextWindow:
             else:
                 self.next_page()
             return "break"
-        if self.has_alt(event) and keysym in {str(number) for number in range(1, 10)}:
+        if self.is_alt_number_shortcut(event):
             self.switch_to_page_index(int(keysym) - 1)
             return "break"
         if ctrl and keysym == "Up":
@@ -1063,15 +1106,23 @@ class PrivateTextWindow:
         return None
 
     def has_ctrl(self, event: tk.Event) -> bool:
+        if IS_WINDOWS:
+            return is_virtual_key_down(VK_CONTROL)
         return bool(int(event.state) & 0x0004)
 
     def has_shift(self, event: tk.Event) -> bool:
+        if IS_WINDOWS:
+            return is_virtual_key_down(VK_SHIFT)
         return bool(int(event.state) & 0x0001)
 
     def has_alt(self, event: tk.Event) -> bool:
+        if IS_WINDOWS:
+            return is_virtual_key_down(VK_MENU)
         return bool(int(event.state) & 0x0008)
 
     def has_ctrl_or_alt(self, event: tk.Event) -> bool:
+        if IS_WINDOWS:
+            return is_virtual_key_down(VK_CONTROL) or is_virtual_key_down(VK_MENU)
         state = int(event.state)
         return bool(state & 0x0004) or bool(state & 0x0008)
 
